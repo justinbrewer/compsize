@@ -14,7 +14,9 @@
 #include <linux/limits.h>
 #include <getopt.h>
 #include <signal.h>
-#include "radix-tree.h"
+#include <errno.h>
+#include <string.h>
+#include "bitmap.h"
 #include "endianness.h"
 
 #if defined(DEBUG)
@@ -50,7 +52,7 @@ struct workspace
         uint64_t nfiles;
         uint64_t nextents, nrefs, ninline, nfrag;
         uint64_t fragend;
-        struct radix_tree_root seen_extents;
+        struct bitmap seen_extents;
 };
 
 static const char *comp_types[MAX_ENTRIES] = { "none", "zlib", "lzo", "zstd" };
@@ -93,6 +95,11 @@ static void init_sv2_args(ino_t st_ino, struct btrfs_sv2_args *sv2_args)
         sv2_args->buf_size = sizeof(sv2_args->buf);
 }
 
+static inline int IS_ALIGNED(uintptr_t ptr, size_t align)
+{
+	return (ptr & (align - 1)) == 0;
+}
+
 static inline int is_hole(uint64_t disk_bytenr)
 {
     return disk_bytenr == 0;
@@ -105,6 +112,7 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
     uint64_t disk_num_bytes, ram_bytes, disk_bytenr, num_bytes;
     uint32_t inline_header_sz;
     unsigned  comp_type;
+    int rv;
 
     DPRINTF("len=%u\n", hlen);
 
@@ -152,15 +160,20 @@ static void parse_file_extent_item(uint8_t *bp, uint32_t hlen,
     if (!IS_ALIGNED(disk_bytenr, 1 << 12))
         die("%s: Extent not 4K-aligned at %"PRIu64"?!?\n", filename, disk_bytenr);
 
-    unsigned long pageno = disk_bytenr >> 12;
-    radix_tree_preload(GFP_KERNEL);
-    if (radix_tree_insert(&ws->seen_extents, pageno, (void *)pageno) == 0)
+    switch((rv = bitmap_mark(&ws->seen_extents, disk_bytenr >> 12)))
     {
+    case 0:
          ws->disk[comp_type] += disk_num_bytes;
          ws->uncomp[comp_type] += ram_bytes;
          ws->nextents++;
+         break;
+    case 1:
+         break;
+    default:
+         errno = -rv;
+         die("bitmak_mark: %m\n");
     }
-    radix_tree_preload_end();
+
     ws->refd[comp_type] += num_bytes;
     ws->nrefs++;
 
@@ -439,6 +452,7 @@ static int print_stats(struct workspace *ws)
 
 int main(int argc, char **argv)
 {
+    int rv;
     struct workspace *ws;
 
     ws = (struct workspace *) calloc(sizeof(*ws), 1);
@@ -451,8 +465,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    radix_tree_init();
-    INIT_RADIX_TREE(&ws->seen_extents, 0);
+    if((rv = bitmap_init(&ws->seen_extents))) {
+        errno = -rv;
+        die("bitmap_init: %m\n");
+    }
+
     signal(SIGUSR1, sigusr1);
 
     for (; argv[optind]; optind++)
@@ -460,6 +477,7 @@ int main(int argc, char **argv)
 
     int ret = print_stats(ws);
 
+    bitmap_destroy(&ws->seen_extents);
     free(ws);
 
     return ret;
